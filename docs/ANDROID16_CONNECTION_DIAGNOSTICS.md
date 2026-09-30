@@ -82,3 +82,16 @@ Do not extract identities from the installed private beta APK. See BUILD.md.
 
 Rollback: stop the probe, uninstall `com.shihab.diplay.hudtest`, or revert the patch commits
 in the fork. The existing private beta app and its data remain installed.
+
+## Prepared iPhone boundary
+
+The debug activity now shows the temporary joining network/password locally only after
+P2P startup succeeds; these credentials are never sent to diagnostics and the window is
+marked FLAG_SECURE. It also has **Wait for iPhone USB**, which registers a USB attach
+receiver and records initial discovery. Detection stops at the Apple matcher boundary;
+it does not request permission, reconfigure USB, or start authentication.
+
+Both paths are available without MFi assets. Closing the activity removes the temporary
+P2P group and unregisters the USB receiver. The user confirmed no build-time runtime
+authentication assets are available. The standalone build guard rejects that missing
+input as expected; the full CarPlay session remains blocked on legitimate provisioning.
