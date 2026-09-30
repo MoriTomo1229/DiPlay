@@ -72,7 +72,7 @@ permission. An empty list establishes only that Android has no host device in th
 
 2026-09-30 JST: real-device probe reproduces the baseline failure, then the patched probe
 completes P2P bring-up on 2437 MHz / channel 6 / WPA_WPA2. This does not prove iPhone
-association, independent beacon security, MFi authentication, CarPlay video/touch, 30fps
+association, MFi authentication, CarPlay video/touch, 30fps
 stability, or USB discovery with an attached iPhone. The last system-selected fallback
 remains tested by the existing unit tests; this device accepted 2437 MHz before reaching it.
 
@@ -95,3 +95,14 @@ Both paths are available without MFi assets. Closing the activity removes the te
 P2P group and unregisters the USB receiver. The user confirmed no build-time runtime
 authentication assets are available. The standalone build guard rejects that missing
 input as expected; the full CarPlay session remains blocked on legitimate provisioning.
+
+## Follow-up: network visibility
+
+The user reported the network missing from the iPhone list. Both the original DiPlay and
+the debug probe were running, and the probe saw repeated group formed/removed broadcasts.
+After stopping the original app and recreating the probe group, a PC Wi-Fi rescan matched
+the framework's current group network at 2437 MHz, advertised WPA2, signal 100 on
+NetworkManager's relative scale. The label/password were not exported. This independently
+confirms the beacon's visibility and advertised security in this test. It does not prove
+iPhone association or identify which app requested the earlier removals. Keep other
+projection apps stopped while testing, and use the current joining details after recreation.
