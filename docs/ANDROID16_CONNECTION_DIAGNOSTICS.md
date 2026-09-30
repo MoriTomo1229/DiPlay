@@ -106,3 +106,7 @@ NetworkManager's relative scale. The label/password were not exported. This inde
 confirms the beacon's visibility and advertised security in this test. It does not prove
 iPhone association or identify which app requested the earlier removals. Keep other
 projection apps stopped while testing, and use the current joining details after recreation.
+
+The user then confirmed the current network is visible on the iPhone and association
+succeeds. This is a human-reported PASS for network visibility/association after restarting
+the isolated probe, not a CarPlay session PASS. Authentication assets are still absent.
