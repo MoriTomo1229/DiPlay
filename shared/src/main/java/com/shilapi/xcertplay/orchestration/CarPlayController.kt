@@ -167,6 +167,7 @@ class CarPlayController(
         } else {
             IphoneUsbMatcher.appleVendor()
         },
+        diagnostic = ::debugLog,
     )
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val touchExecutor: ExecutorService = Executors.newSingleThreadExecutor()

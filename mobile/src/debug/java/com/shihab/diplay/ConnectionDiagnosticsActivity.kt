@@ -2,6 +2,7 @@ package com.shihab.diplay
 
 import android.Manifest
 import android.app.Activity
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -10,6 +11,9 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import com.shilapi.xcertplay.network.WifiP2pGroupManager
+import com.shilapi.xcertplay.transport.IphoneUsbHost
+import com.shilapi.xcertplay.transport.IphoneUsbMatcher
+import java.io.File
 import java.util.concurrent.Executors
 
 /** Debug-only transport probe. Does not load authentication assets or start CarPlay. */
@@ -34,7 +38,15 @@ class ConnectionDiagnosticsActivity : Activity() {
             })
             addView(Button(this@ConnectionDiagnosticsActivity).apply {
                 text = "Stop Wi-Fi test"
-                setOnClickListener { executor.execute { manager?.close(); manager = null; report("Probe stopped") } }
+                setOnClickListener { manager?.close(); manager = null; report("Probe stopped") }
+            })
+            addView(Button(this@ConnectionDiagnosticsActivity).apply {
+                text = "Inspect USB devices"
+                setOnClickListener {
+                    IphoneUsbHost(this@ConnectionDiagnosticsActivity,
+                        getSystemService(UsbManager::class.java), IphoneUsbMatcher.appleVendor(),
+                        diagnostic = ::report).discover()
+                }
             })
             addView(ScrollView(this@ConnectionDiagnosticsActivity).apply { addView(output) })
         }
@@ -67,8 +79,10 @@ class ConnectionDiagnosticsActivity : Activity() {
         }
     }
 
+    @Synchronized
     private fun report(message: String) {
         // The manager emits selected metadata only; never print the hotspot info object.
+        File(filesDir, "connection-probe.log").appendText(message + "\n")
         Log.i("DiPlayProbe", message)
         runOnUiThread { output.append(message + "\n") }
     }
