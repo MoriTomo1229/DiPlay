@@ -35,11 +35,68 @@ class WifiP2pGroupManagerTest {
     private val radio get() = shadowOf(context.getSystemService(WifiP2pManager::class.java)) as P2pRadio
 
     @Before fun setup() {
-        shadowOf(context).grantPermissions(Manifest.permission.ACCESS_FINE_LOCATION)
+        shadowOf(context).grantPermissions(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES)
         val wifi = context.getSystemService(WifiManager::class.java)
         wifi.isWifiEnabled = true
         shadowOf(wifi.connectionInfo).setFrequency(5180)
         shadowOf(wifi.connectionInfo).setSupplicantState(SupplicantState.COMPLETED)
+    }
+
+    @Test @Config(sdk = [36]) fun unknownSecurityIsRequeriedAndWpa2CanSettle() {
+        radio.unknownSecurityReads = 2
+        val logs = mutableListOf<String>()
+        WifiP2pGroupManager(context, logs::add).use { manager ->
+            val info = background { manager.start(6000) }
+            assertEquals(com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA_WPA2, info.security)
+            assertEquals(1, radio.requests.size)
+            assertTrue(logs.any { it.contains("security pending raw=-1") })
+            assertTrue(logs.any { it.contains("securityRaw=0") })
+            assertFalse(logs.any { it.contains(info.passphrase) || it.contains(info.ssid) })
+        }
+    }
+
+    @Test @Config(sdk = [36]) fun persistentUnknownUsesOnlyMatchingExplicitLegacyConfiguration() {
+        radio.unknownSecurityReads = Int.MAX_VALUE
+        val logs = mutableListOf<String>()
+        WifiP2pGroupManager(context, logs::add).use { manager ->
+            val info = background { manager.start(6000) }
+            assertEquals(com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA_WPA2, info.security)
+            assertEquals(WifiP2pConfig.PCC_MODE_CONNECTION_TYPE_LEGACY_ONLY, radio.requests.single()!!.pccModeConnectionType)
+            assertTrue(logs.any { it.contains("source=explicit_LEGACY_ONLY") })
+            assertEquals(1, radio.requests.size)
+        }
+    }
+
+    @Test @Config(sdk = [36]) fun unknownSystemSelectedGroupStillFails() {
+        radio.rejectCustom = true
+        radio.unknownSecurityReads = Int.MAX_VALUE
+        WifiP2pGroupManager(context).use { manager ->
+            val failure = assertThrows(ExecutionException::class.java) {
+                background { manager.start(10_000) }
+            }
+            assertTrue(failure.cause!!.message!!.contains("no matching explicit WPA2"))
+            assertNull(radio.requests.last())
+        }
+    }
+
+    @Test @Config(sdk = [36]) fun unknownWithMissingGroupCredentialsStillFails() {
+        radio.missingCredentials = true
+        radio.unknownSecurityReads = Int.MAX_VALUE
+        WifiP2pGroupManager(context).use { manager ->
+            val failure = assertThrows(ExecutionException::class.java) {
+                background { manager.start(6000) }
+            }
+            assertTrue(failure.cause!!.message!!.contains("no matching explicit WPA2"))
+        }
+    }
+
+    @Test @Config(sdk = [36]) fun settledWpa3IsPreservedAfterUnknownSecurity() {
+        radio.unknownSecurityReads = 2
+        radio.securityType = WifiP2pGroup.SECURITY_TYPE_WPA3_SAE
+        WifiP2pGroupManager(context).use { manager ->
+            val info = background { manager.start(6000) }
+            assertEquals(com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA3_ONLY, info.security)
+        }
     }
 
     @Test fun disconnectedStationCannotPinNewGroupToStaleTwoGhzChannel() {
@@ -357,12 +414,18 @@ class WifiP2pGroupManagerTest {
         var fixed24Only = false
         var allowed24 = setOf(2412, 2437, 2462)
         var reportedFrequency: Int? = null
+        var unknownSecurityReads = 0
+        var securityType = 0
 
         @Implementation protected fun requestP2pState(channel: WifiP2pManager.Channel, listener: WifiP2pManager.P2pStateListener) {
             listener.onP2pStateAvailable(WifiP2pManager.WIFI_P2P_STATE_ENABLED)
         }
 
         @Implementation override fun requestGroupInfo(channel: WifiP2pManager.Channel, listener: WifiP2pManager.GroupInfoListener) {
+            if (android.os.Build.VERSION.SDK_INT >= 36 && group != null) {
+                ReflectionHelpers.setField(group, "mSecurityType",
+                    if (unknownSecurityReads > 0) { unknownSecurityReads--; -1 } else securityType)
+            }
             listener.onGroupInfoAvailable(group)
         }
 

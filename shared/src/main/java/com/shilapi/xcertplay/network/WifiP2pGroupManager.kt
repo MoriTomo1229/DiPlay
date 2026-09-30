@@ -2,7 +2,10 @@ package com.shilapi.xcertplay.network
 
 import android.Manifest
 import android.app.AppOpsManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.wifi.SupplicantState
@@ -18,6 +21,7 @@ import android.provider.Settings
 import android.util.Log
 import androidx.annotation.RequiresApi
 import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
+import java.io.Closeable
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -115,6 +119,7 @@ class WifiP2pGroupManager(
                 callbackThread = thread
             }
 
+            attempt.receiver = registerStateDiagnostics()
             logP2pState(attempt, p2pChannel)
             // Preferences disappear on reinstall, but the scoped namespace survives.
             val existing = requestGroupInfo(attempt, p2pChannel, REQUEST_POLL_NANOS, requireResponse = true)
@@ -154,6 +159,9 @@ class WifiP2pGroupManager(
                         val builder = WifiP2pConfig.Builder()
                             .setNetworkName(credentials.ssid)
                             .setPassphrase(credentials.passphrase)
+                        if (Build.VERSION.SDK_INT >= 36) {
+                            builder.setPccModeConnectionType(WifiP2pConfig.PCC_MODE_CONNECTION_TYPE_LEGACY_ONLY)
+                        }
                         builder.setGroupOperatingFrequency(requireNotNull(selection.frequencyMHz))
                         builder.build()
                     }
@@ -249,6 +257,7 @@ class WifiP2pGroupManager(
         if (removeGroup && activeChannel != null) {
             removeGroupBlocking(activeChannel)
         }
+        attempt?.receiver?.close()
         activeChannel?.close()
         activeThread?.quitSafely()
     }
@@ -277,6 +286,7 @@ class WifiP2pGroupManager(
                     false
                 } else true
             }
+            diagnostic("Wi-Fi P2P create accepted api=WifiP2pManager.createGroup(config)")
             if (removeDetachedGroup && activeChannel != null) {
                 removeGroup(activeChannel, waitForCallback = false)
             }
@@ -336,6 +346,7 @@ class WifiP2pGroupManager(
         timeoutMillis: Long,
     ): WirelessHotspotInfo {
         var lastReason = "group information was not available"
+        var securityDeadlineNanos: Long? = null
         while (true) {
             ensureStartActive(attempt)
             val remainingNanos = remainingNanos(deadlineNanos)
@@ -351,7 +362,10 @@ class WifiP2pGroupManager(
                 channel = channel,
                 timeoutNanos = minOf(remainingNanos, REQUEST_POLL_NANOS),
             )
-            if (group == null) continue
+            if (group == null) {
+                synchronized(stateLock) { waitNanos(TimeUnit.MILLISECONDS.toNanos(100)) }
+                continue
+            }
             if (!group.isGroupOwner) {
                 throw IOException("Wi-Fi P2P device became a group client instead of owner")
             }
@@ -380,6 +394,31 @@ class WifiP2pGroupManager(
                 else -> throw IOException("Wi-Fi P2P returned an unsupported band at ${frequencyMHz}MHz")
             }
 
+            // API 36 may publish a group before its key-management metadata is available.
+            // Re-query that same group briefly; never guess WPA2 or create a second group.
+            val rawSecurity = if (Build.VERSION.SDK_INT >= 36) group.securityType else null
+            if (rawSecurity == WifiP2pGroup.SECURITY_TYPE_UNKNOWN) {
+                val securityDeadline = securityDeadlineNanos
+                    ?: minOf(deadlineNanos, deadlineAfter(2_000)).also { securityDeadlineNanos = it }
+                if (remainingNanos(securityDeadline) == 0L) {
+                    // Only our explicitly configured legacy GO has a documented WPA2 contract.
+                    // Unknown system-selected groups have no such evidence and must still fail.
+                    if (credentials == null || networkName != credentials.ssid || group.passphrase != credentials.passphrase) {
+                        throw IOException("Wi-Fi P2P security type remains unknown (-1) after re-query; " +
+                            "no matching explicit WPA2 configuration is available")
+                    }
+                    diagnostic("Wi-Fi P2P security raw=-1 resolved=WPA2 source=explicit_LEGACY_ONLY matchingCredentials=true")
+                } else {
+                    diagnostic("Wi-Fi P2P security pending raw=-1 source=WifiP2pGroup.getSecurityType retry=true")
+                    synchronized(stateLock) {
+                        ensureStartActiveLocked(attempt)
+                        waitNanos(minOf(TimeUnit.MILLISECONDS.toNanos(100), remainingNanos(securityDeadline).coerceAtLeast(1)))
+                    }
+                    continue
+                }
+            }
+            val security = if (rawSecurity == WifiP2pGroup.SECURITY_TYPE_UNKNOWN)
+                Iap2WirelessSecurity.WPA_WPA2 else groupSecurity(group)
             val hostAddress = awaitInterfaceAddress(attempt, interfaceName, deadlineNanos)
                 ?: requestConnectionAddress(
                     attempt = attempt,
@@ -394,7 +433,7 @@ class WifiP2pGroupManager(
             return WirelessHotspotInfo(
                 ssid = networkName,
                 passphrase = passphrase,
-                security = groupSecurity(group),
+                security = security,
                 channel = channelNumber,
                 frequencyMHz = frequencyMHz,
                 bssid = interfaceHardwareAddress(interfaceName)
@@ -430,7 +469,9 @@ class WifiP2pGroupManager(
             return null
         }
         ensureStartActive(attempt)
-        return result.get()
+        val group = result.get()
+        logGroupDetails(group, "requestGroupInfo")
+        return group
     }
 
     private fun requestConnectionAddress(
@@ -447,6 +488,7 @@ class WifiP2pGroupManager(
         if (!await(latch, timeoutNanos)) return null
         ensureStartActive(attempt)
         val info = result.get() ?: return null
+        diagnostic("Wi-Fi P2P connection source=requestConnectionInfo formed=${info.groupFormed} owner=${info.isGroupOwner} address=${info.groupOwnerAddress?.hostAddress ?: "unavailable"}")
         if (!info.groupFormed) return null
         return info.groupOwnerAddress?.takeUnless(InetAddress::isAnyLocalAddress)
     }
@@ -521,7 +563,7 @@ class WifiP2pGroupManager(
             appContext.getSystemService(AppOpsManager::class.java)?.unsafeCheckOpNoThrow(
                 AppOpsManager.OPSTR_FINE_LOCATION, android.os.Process.myUid(), appContext.packageName)
         }.getOrNull() else null
-        diagnostic("Wi-Fi P2P preflight wifiEnabled=$wifiEnabled locationEnabled=$locationEnabled permissionGranted=$granted locationAccessMode=${locationAccessMode ?: "unknown"} stationMHz=${station.alignmentFrequency ?: "unknown"} stationState=${station.state ?: "unknown"} reportedStationMHz=${station.reportedFrequency ?: "unknown"} fiveGhzSupported=${fiveGhzSupported ?: "unknown"}")
+        diagnostic("Wi-Fi P2P preflight api=${Build.VERSION.SDK_INT} wifiEnabled=$wifiEnabled locationEnabled=$locationEnabled permissionGranted=$granted locationAccessMode=${locationAccessMode ?: "unknown"} stationMHz=${station.alignmentFrequency ?: "unknown"} stationState=${station.state ?: "unknown"} reportedStationMHz=${station.reportedFrequency ?: "unknown"} fiveGhzSupported=${fiveGhzSupported ?: "unknown"}")
         if (!granted) throw IOException(if (Build.VERSION.SDK_INT >= 33)
             "Allow Nearby devices for DiPlay in the head unit's app permissions"
             else "Allow precise Location for DiPlay in the head unit's app permissions")
@@ -550,6 +592,43 @@ class WifiP2pGroupManager(
         NetworkInterface.getByName(interfaceName)
     } catch (_: SocketException) {
         null
+    }
+
+    private fun logGroupDetails(group: WifiP2pGroup?, source: String) {
+        if (group == null) {
+            diagnostic("Wi-Fi P2P group source=$source present=false")
+            return
+        }
+        // Never print WifiP2pGroup.toString(): it contains the passphrase and device identifiers.
+        val security = if (Build.VERSION.SDK_INT >= 36) group.securityType.toString() else "legacy"
+        diagnostic("Wi-Fi P2P group source=$source present=true owner=${group.isGroupOwner} " +
+            "networkLabelPresent=${!group.networkName.isNullOrBlank()} iface=${group.getInterface()} " +
+            "frequencyMHz=${group.frequency} securityRaw=$security securitySource=WifiP2pGroup.getSecurityType")
+    }
+
+    private fun registerStateDiagnostics(): Closeable {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> diagnostic(
+                        "Wi-Fi P2P broadcast state=${intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)}")
+                    WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
+                        @Suppress("DEPRECATION")
+                        val info = intent.getParcelableExtra<WifiP2pInfo>(WifiP2pManager.EXTRA_WIFI_P2P_INFO)
+                        diagnostic("Wi-Fi P2P broadcast connection formed=${info?.groupFormed} owner=${info?.isGroupOwner}")
+                        @Suppress("DEPRECATION")
+                        val group = intent.getParcelableExtra<WifiP2pGroup>(WifiP2pManager.EXTRA_WIFI_P2P_GROUP)
+                        logGroupDetails(group, "broadcast")
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION).apply {
+            addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
+        }
+        if (Build.VERSION.SDK_INT >= 33) appContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        else appContext.registerReceiver(receiver, filter)
+        return Closeable { runCatching { appContext.unregisterReceiver(receiver) } }
     }
 
     private fun groupSecurity(group: WifiP2pGroup): Iap2WirelessSecurity {
@@ -608,6 +687,7 @@ class WifiP2pGroupManager(
         if (removeGroup && failedChannel != null) {
             removeGroupBlocking(failedChannel)
         }
+        attempt.receiver?.close()
         failedChannel?.close()
         failedThread?.quitSafely()
     }
@@ -690,6 +770,7 @@ class WifiP2pGroupManager(
     private class StartAttempt {
         var channel: WifiP2pManager.Channel? = null
         var thread: HandlerThread? = null
+        var receiver: Closeable? = null
         var createSucceeded = false
         var request: CreateRequest? = null
         var failure: IOException? = null

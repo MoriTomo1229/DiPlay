@@ -36,3 +36,8 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation("org.robolectric:robolectric:4.17")
 }
+
+// Robolectric's API 36 shared-memory interceptor accesses the JDK file-descriptor bridge.
+tasks.withType<Test>().configureEach {
+    jvmArgs("--add-exports=java.base/jdk.internal.access=ALL-UNNAMED")
+}

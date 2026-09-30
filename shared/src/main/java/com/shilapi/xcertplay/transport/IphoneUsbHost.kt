@@ -68,6 +68,7 @@ class IphoneUsbHost(
     private val usbManager: UsbManager,
     private val matcher: IphoneUsbMatcher,
     private val permissionAction: String = "${context.packageName}.IPHONE_USB_PERMISSION",
+    private val diagnostic: (String) -> Unit = {},
 ) {
     private val appContext = context.applicationContext
 
@@ -93,8 +94,28 @@ class IphoneUsbHost(
         data class Failed(val error: IphoneUsbException) : Iap2SessionResult()
     }
 
-    fun discover(): List<UsbDevice> =
-        usbManager.deviceList.values.filter { matcher.matches(it.vendorId, it.productId) }
+    private var lastDiscovery: List<String>? = null
+
+    @Synchronized
+    fun discover(): List<UsbDevice> {
+        val devices = usbManager.deviceList.values.sortedBy { it.deviceName }
+        val details = devices.map { device ->
+            // Only the numeric Linux USB bus path is diagnostic. Never read serialNumber,
+            // manufacturerName or productName, including after permission is granted.
+            val path = device.deviceName.takeIf { it.matches(Regex("/dev/bus/usb/[0-9]+/[0-9]+")) } ?: "unavailable"
+            "USB device path=$path vendorId=${device.vendorId} productId=${device.productId} " +
+                "deviceClass=${device.deviceClass} interfaces=${device.interfaceCount} " +
+                "matched=${matcher.matches(device.vendorId, device.productId)} permission=${usbManager.hasPermission(device)}"
+        }
+        if (details != lastDiscovery) {
+            diagnostic("USB discovery api=${Build.VERSION.SDK_INT} enumerated=${devices.size} " +
+                "matched=${devices.count { matcher.matches(it.vendorId, it.productId) }}")
+            details.forEach(diagnostic)
+            if (devices.isEmpty()) diagnostic("USB discovery empty: Android UsbManager has no host devices; check cable and USB host role")
+            lastDiscovery = details
+        }
+        return devices.filter { matcher.matches(it.vendorId, it.productId) }
+    }
 
     @Throws(IphoneUsbException::class)
     fun requestPermission(device: UsbDevice): PermissionRequest {
